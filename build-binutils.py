@@ -120,7 +120,7 @@ for item in targets:
             builder.folders.install = Path(args.install_folder).resolve()
         builder.folders.source = bsm.location
         if args.march:
-            builder.cflags += [f"-march={args.march}", f"-mtune={args.march}"]
+            builder.cflags += [f"-march={args.march}", f"-mtune={args.march}",f"LDFLAGS=-O3"]
         builder.show_commands = args.show_build_commands
         builder.build()
     else:

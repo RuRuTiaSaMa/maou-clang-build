@@ -14,7 +14,7 @@ class BinutilsBuilder(Builder):
     def __init__(self):
         super().__init__()
 
-        self.cflags = ['-O3 -flto']
+        self.cflags = ['-O3 -flto -pipe -ffunction-sections -fdata-sections']
         self.configure_flags = [
             '--disable-compressed-debug-sections',
             '--disable-gdb',

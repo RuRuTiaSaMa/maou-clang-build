@@ -7,7 +7,7 @@ variable "packet_ssh_key" {
 }
 
 variable "github_user" {
-    default = "kdrag0n"
+    default = "RuRuTiaSaMa"
 }
 
 variable "github_token" {
@@ -15,11 +15,11 @@ variable "github_token" {
 }
 
 variable "github_build_repo" {
-    default = "kdrag0n/proton-clang-build"
+    default = "RuRuTiaSaMa/maou-clang-build"
 }
 
 variable "github_release_repo" {
-    default = "kdrag0n/proton-clang"
+    default = "RuRuTiaSaMa/maou-clang"
 }
 
 variable "github_run_id" {
@@ -47,5 +47,5 @@ variable "project_id" {
 }
 
 variable "hostname" {
-    default = "proton-clang-builder-01"
+    default = "maou-clang-builder-01"
 }

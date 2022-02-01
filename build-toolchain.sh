@@ -16,6 +16,7 @@ msg "Building LLVM..."
 	--clang-vendor "Maou" \
 	--projects "clang;compiler-rt;lld;polly" \
 	--targets "ARM;AArch64;X86" \
+	--defines "CMAKE_C_FLAGS=-O3 CMAKE_CXX_FLAGS=-O3" \
 	"$repo_flag" \
 	--pgo kernel-defconfig \
 	--lto full

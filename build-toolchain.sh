@@ -2,6 +2,9 @@
 
 set -eo pipefail
 
+base=$(dirname "$(readlink -f "$0")")
+install=$base/install
+
 # Function to show an informational message
 function msg() {
     echo -e "\e[1;32m$@\e[0m"
@@ -13,34 +16,36 @@ function msg() {
 # Build LLVM
 msg "Building LLVM..."
 ./build-llvm.py \
-	--clang-vendor "Maou" \
-	--projects "clang;compiler-rt;lld;polly" \
-	--targets "ARM;AArch64;X86" \
+	--vendor-string "Maou" \
+	--targets ARM AArch64 X86 \
+	--install-folder "$install" \
 	--defines "LLVM_PARALLEL_COMPILE_JOBS=$(nproc) LLVM_PARALLEL_LINK_JOBS=$(nproc) CMAKE_C_FLAGS=-O3 CMAKE_CXX_FLAGS=-O3 LLVM_USE_LINKER=lld LLVM_ENABLE_LLD=ON" \
 	"$repo_flag" \
-	--projects "clang;lld;polly;compiler-rt;bolt" \
+	--projects clang lld polly compiler-rt bolt \
 	--pgo kernel-defconfig \
 	--lto thin \
 	--bolt
 
 # Build binutils
 msg "Building binutils..."
-./build-binutils.py --targets arm aarch64 x86_64
+./build-binutils.py \
+ --targets arm aarch64 x86_64 \
+ --install-folder "$install"
 
 # Remove unused products
 msg "Removing unused products..."
-rm -fr install/include
-rm -f install/lib/*.a install/lib/*.la
+rm -fr $install/include
+rm -f $install/lib/*.a $install/lib/*.la
 
 # Strip remaining products
 msg "Stripping remaining products..."
-for f in $(find install -type f -exec file {} \; | grep 'not stripped' | awk '{print $1}'); do
+for f in $(find $install -type f -exec file {} \; | grep 'not stripped' | awk '{print $1}'); do
 	strip ${f: : -1}
 done
 
 # Set executable rpaths so setting LD_LIBRARY_PATH isn't necessary
 msg "Setting library load paths for portability..."
-for bin in $(find install -mindepth 2 -maxdepth 3 -type f -exec file {} \; | grep 'ELF .* interpreter' | awk '{print $1}'); do
+for bin in $(find $install -mindepth 2 -maxdepth 3 -type f -exec file {} \; | grep 'ELF .* interpreter' | awk '{print $1}'); do
 	# Remove last character from file output (':')
 	bin="${bin: : -1}"
 

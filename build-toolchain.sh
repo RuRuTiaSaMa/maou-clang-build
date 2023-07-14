@@ -5,13 +5,12 @@ set -eo pipefail
 base=$(dirname "$(readlink -f "$0")")
 install=$base/install
 
+rm -rf $install
+
 # Function to show an informational message
 function msg() {
     echo -e "\e[1;32m$@\e[0m"
 }
-
-# Don't touch repo if running on CI
-[ -z "$GH_RUN_ID" ] && repo_flag="--shallow-clone" || repo_flag="--no-update"
 
 # Build LLVM
 msg "Building LLVM..."
@@ -20,11 +19,10 @@ msg "Building LLVM..."
 	--targets ARM AArch64 X86 \
 	--install-folder "$install" \
 	--defines "LLVM_PARALLEL_COMPILE_JOBS=$(nproc) LLVM_PARALLEL_LINK_JOBS=$(nproc) CMAKE_C_FLAGS=-O3 CMAKE_CXX_FLAGS=-O3 LLVM_USE_LINKER=lld LLVM_ENABLE_LLD=ON" \
-	"$repo_flag" \
 	--projects clang lld polly compiler-rt bolt \
 	--pgo kernel-defconfig \
 	--lto thin \
-	--bolt
+	--bolt 
 
 # Build binutils
 msg "Building binutils..."

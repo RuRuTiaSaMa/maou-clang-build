@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from tempfile import NamedTemporaryFile
 import time
 
 from tc_build.builder import Builder
@@ -16,15 +17,16 @@ class KernelBuilder(Builder):
     # If the user supplies their own kernel source, it must be at least this
     # version to ensure that all the build commands work, as the build commands
     # were written to target at least this version.
-    MINIMUM_SUPPORTED_VERSION = (6, 5, 0)
+    MINIMUM_SUPPORTED_VERSION = (6, 9, 0)
 
     def __init__(self, arch):
         super().__init__()
 
         self.bolt_instrumentation = False
         self.bolt_sampling_output = None
-        self.config_targets = None
+        self.config_targets = []
         self.cross_compile = None
+        self.lsm = None
         self.make_variables = {
             'ARCH': arch,
             # We do not want warnings to cause build failures when profiling.
@@ -32,12 +34,9 @@ class KernelBuilder(Builder):
         }
         self.show_commands = True
         self.toolchain_prefix = None
-        self.toolchain_version = None
+        self.toolchain_version = ()
 
     def build(self):
-        if not self.toolchain_version:
-            self.toolchain_version = self.get_toolchain_version()
-
         if self.bolt_instrumentation:
             self.make_variables['CC'] = Path(self.toolchain_prefix, 'bin/clang.inst')
         # The user may have configured clang without the host target, in which
@@ -60,6 +59,34 @@ class KernelBuilder(Builder):
             self.make_variables['LLVM_IAS'] = '0'
         self.make_variables['O'] = self.folders.build
 
+        self.clean_build_folder()
+
+        kconfig_allconfig = None
+        # allmodconfig enables CONFIG_WERROR and other subsystem specific
+        # -Werror configurations. Ensure all known configurations get disabled
+        # via KCONFIG_ALLCONFIG, as they may override KCFLAGS=-Werror.
+        if 'allmodconfig' in self.config_targets:
+            self.folders.build.mkdir(parents=True)
+
+            # Using a context manager for this would seriously convolute this
+            # code, as we need to use the name of the object in make_cmd but
+            # delete it after actually running the command so the rest of the
+            # code after this function would need another level of indent. We
+            # know that from this point forward, the function can only throw an
+            # exception when calling make_cmd, so we can just wrap that in a
+            # try: ... finally: ... statement to ensure that this file is
+            # always cleaned up.
+            # pylint: disable-next=consider-using-with
+            kconfig_allconfig = NamedTemporaryFile(dir=self.folders.build)  # noqa: SIM115
+
+            configs_to_disable = ['DRM_WERROR', 'WERROR']
+            kconfig_allconfig_text = ''.join(f"CONFIG_{val}=n\n"
+                                             for val in configs_to_disable).encode('utf-8')
+
+            kconfig_allconfig.write(kconfig_allconfig_text)
+            kconfig_allconfig.seek(0)
+            self.make_variables['KCONFIG_ALLCONFIG'] = kconfig_allconfig.name
+
         make_cmd = []
         if self.bolt_sampling_output:
             make_cmd += [
@@ -77,15 +104,21 @@ class KernelBuilder(Builder):
         # Ideally, the kernel would always clobber user flags via ':=' but we deal with reality.
         os.environ.pop('CFLAGS', '')
 
-        self.clean_build_folder()
         build_start = time.time()
-        self.run_cmd(make_cmd)
+        try:
+            self.run_cmd(make_cmd)
+        finally:
+            if kconfig_allconfig:
+                kconfig_allconfig.close()
         tc_build.utils.print_info(f"Build duration: {tc_build.utils.get_duration(build_start)}")
 
     def can_use_ias(self):
         return True
 
     def get_toolchain_version(self):
+        if self.toolchain_version:
+            return self.toolchain_version
+
         if not self.toolchain_prefix:
             raise RuntimeError('get_toolchain_version(): No toolchain prefix set?')
         if not (clang := Path(self.toolchain_prefix, 'bin/clang')).exists():
@@ -99,7 +132,8 @@ class KernelBuilder(Builder):
                                       input=clang_input,
                                       text=True).stdout.strip()
 
-        return tuple(int(elem) for elem in clang_output.split(' '))
+        self.toolchain_version = tuple(int(elem) for elem in clang_output.split(' '))
+        return self.toolchain_version
 
     def can_use_clang_as_hostcc(self):
         clang = Path(self.toolchain_prefix, 'bin/clang')
@@ -123,7 +157,7 @@ class ArmKernelBuilder(KernelBuilder):
         self.cross_compile = 'arm-linux-gnueabi-'
 
     def can_use_ias(self):
-        return self.toolchain_version >= (13, 0, 0)
+        return self.get_toolchain_version() >= (13, 0, 0)
 
 
 class ArmV5KernelBuilder(ArmKernelBuilder):
@@ -140,6 +174,19 @@ class ArmV6KernelBuilder(ArmKernelBuilder):
         super().__init__()
 
         self.config_targets = ['aspeed_g5_defconfig']
+
+    def build(self):
+        if not self.lsm:
+            raise RuntimeError('build() called without LinuxSourceManager?')
+
+        if self.get_toolchain_version() < (14, 0, 0) and self.lsm.get_version() >= (6, 14, 0):
+            # https://github.com/ClangBuiltLinux/continuous-integration2/pull/807
+            tc_build.utils.print_warning(
+                'aspeed_g5_defconfig does not build with LLVM < 14.0.0 and Linux >= 6.14.0, skipping build...'
+            )
+            return
+
+        super().build()
 
 
 class ArmV7KernelBuilder(ArmKernelBuilder):
@@ -168,9 +215,8 @@ class LoongArchKernelBuilder(KernelBuilder):
         super().__init__('loongarch')
 
     def build(self):
-        self.toolchain_version = self.get_toolchain_version()
         # https://git.kernel.org/linus/4d35d6e56447a5d09ccd1c1b3a6d3783b2947670
-        if self.toolchain_version < (min_version := (18, 0, 0)):
+        if self.get_toolchain_version() < (min_version := (18, 0, 0)):
             tc_build.utils.print_warning(
                 f"LoongArch does not build with LLVM < {'.'.join(map(str, min_version))}, skipping build..."
             )
@@ -215,7 +261,7 @@ class PowerPC64KernelBuilder(PowerPCKernelBuilder):
 
     # https://github.com/llvm/llvm-project/commit/33504b3bbe10d5d4caae13efcb99bd159c126070
     def can_use_ias(self):
-        return self.toolchain_version >= (14, 0, 2)
+        return self.get_toolchain_version() >= (14, 0, 2)
 
     # https://github.com/ClangBuiltLinux/linux/issues/1601
     def needs_binutils(self):
@@ -231,9 +277,8 @@ class PowerPC64LEKernelBuilder(PowerPC64KernelBuilder):
         self.cross_compile = 'powerpc64le-linux-gnu-'
 
     def build(self):
-        self.toolchain_version = self.get_toolchain_version()
         # https://github.com/ClangBuiltLinux/linux/issues/1260
-        if self.toolchain_version < (12, 0, 0):
+        if self.get_toolchain_version() < (12, 0, 0):
             self.make_variables['LD'] = self.cross_compile + 'ld'
 
         super().build()
@@ -248,7 +293,7 @@ class RISCVKernelBuilder(KernelBuilder):
 
     # https://github.com/llvm/llvm-project/commit/bbea64250f65480d787e1c5ff45c4de3ec2dcda8
     def can_use_ias(self):
-        return self.toolchain_version >= (13, 0, 0)
+        return self.get_toolchain_version() >= (13, 0, 0)
 
 
 class S390KernelBuilder(KernelBuilder):
@@ -258,19 +303,39 @@ class S390KernelBuilder(KernelBuilder):
 
         self.cross_compile = 's390x-linux-gnu-'
 
-        # LD: https://github.com/ClangBuiltLinux/linux/issues/1524
-        # OBJCOPY: https://github.com/ClangBuiltLinux/linux/issues/1530
-        # OBJDUMP: https://github.com/ClangBuiltLinux/linux/issues/859
-        for key in ['LD', 'OBJCOPY', 'OBJDUMP']:
-            self.make_variables[key] = self.cross_compile + key.lower()
-
     def build(self):
-        self.toolchain_version = self.get_toolchain_version()
-        if self.toolchain_version <= (15, 0, 0):
+        if self.get_toolchain_version() <= (15, 0, 0):
             # https://git.kernel.org/linus/30d17fac6aaedb40d111bb159f4b35525637ea78
             tc_build.utils.print_warning(
                 's390 does not build with LLVM < 15.0.0, skipping build...')
             return
+
+        # LD: https://github.com/ClangBuiltLinux/linux/issues/1524
+        # OBJCOPY: https://github.com/ClangBuiltLinux/linux/issues/1530
+        gnu_vars = []
+
+        # https://github.com/llvm/llvm-project/pull/75643
+        lld_res = subprocess.run([Path(self.toolchain_prefix, 'bin/ld.lld'), '-m', 'elf64_s390'],
+                                 capture_output=True,
+                                 check=False,
+                                 text=True)
+        if 'error: unknown emulation:' in lld_res.stderr:
+            gnu_vars.append('LD')
+
+        # https://github.com/llvm/llvm-project/pull/81841
+        objcopy_res = subprocess.run([
+            Path(self.toolchain_prefix, 'bin/llvm-objcopy'), '-I', 'binary', '-O', 'elf64-s390',
+            '-', '/dev/null'
+        ],
+                                     capture_output=True,
+                                     check=False,
+                                     input='',
+                                     text=True)
+        if 'error: invalid output format:' in objcopy_res.stderr:
+            gnu_vars.append('OBJCOPY')
+
+        for key in gnu_vars:
+            self.make_variables[key] = self.cross_compile + key.lower()
 
         super().build()
 
@@ -278,13 +343,25 @@ class S390KernelBuilder(KernelBuilder):
         return True
 
     def needs_binutils(self):
-        return True
+        return 'LD' in self.make_variables or 'OBJCOPY' in self.make_variables
 
 
 class X8664KernelBuilder(KernelBuilder):
 
     def __init__(self):
         super().__init__('x86_64')
+
+    def build(self):
+        if not self.lsm:
+            raise RuntimeError('build() called without LinuxSourceManager?')
+
+        if self.get_toolchain_version() < (15, 0, 0) and self.lsm.get_version() >= (6, 15, 0):
+            # https://git.kernel.org/linus/7861640aac52bbbb3dc2cd40fb93dfb3b3d0f43c
+            tc_build.utils.print_warning(
+                'x86_64 does not build with LLVM < 15.0.0 and Linux >= 6.15.0, skipping build...')
+            return
+
+        super().build()
 
 
 class LLVMKernelBuilder(Builder):
@@ -357,6 +434,7 @@ class LLVMKernelBuilder(Builder):
             builder.bolt_sampling_output = self.bolt_sampling_output
             builder.folders.build = self.folders.build
             builder.folders.source = self.folders.source
+            builder.lsm = lsm
             builder.toolchain_prefix = self.toolchain_prefix
             builder.build()
 
@@ -367,6 +445,7 @@ class LinuxSourceManager(SourceManager):
         super().__init__(location)
 
         self.patches = []
+        self._version = ()
 
     def get_kernelversion(self):
         return subprocess.run(['make', '-s', 'kernelversion'],
@@ -380,7 +459,10 @@ class LinuxSourceManager(SourceManager):
     # particular version.
     def get_version(self):
         # elem.split('-')[0] in case we are dealing with an -rc release.
-        return tuple(int(elem.split('-')[0]) for elem in self.get_kernelversion().split('.', 3))
+        if not self._version:
+            self._version = tuple(
+                int(elem.split('-')[0]) for elem in self.get_kernelversion().split('.', 3))
+        return self._version
 
     def prepare(self):
         self.tarball.download()
@@ -406,7 +488,10 @@ class LinuxSourceManager(SourceManager):
                 # been applied.
                 if 'Reversed (or previously applied) patch detected' in err.stdout:
                     tc_build.utils.print_warning(
-                        f"Patch ('{patch}') has already been applied, consider removing it")
+                        f"{patch} has already been applied in {self.location}, consider removing it"
+                    )
                 else:
                     raise err
-        tc_build.utils.print_info(f"Source sucessfully prepared in {self.location}")
+            else:
+                tc_build.utils.print_info(f"Applied {patch} to {self.location}")
+        tc_build.utils.print_info(f"Source successfully prepared in {self.location}")
